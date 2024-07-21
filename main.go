@@ -1,182 +1,89 @@
 package main
 
 import (
-	"bufio"
-	"context"
-	"flag"
+	"embed"
 	"fmt"
-	"io/fs"
 	"log"
+	"net"
+	"net/http"
 	"os"
-	"path/filepath"
-	"strings"
+	"os/signal"
+	"runtime"
+	"sync"
 
-	"github.com/chromedp/cdproto/network"
-	"github.com/chromedp/cdproto/runtime"
-	"github.com/chromedp/chromedp"
-	"github.com/graniticio/inifile"
+	"github.com/zserge/lorca"
 )
 
-var (
-	dir string
-)
+//go:embed www
+var fs embed.FS
 
-func main() {
-	flag.StringVar(&dir, "dir", "", "Absolute path for target directory")
-
-	flag.Parse()
-	if len(dir) < 1 {
-		log.Fatal("No --dir is given")
-	}
-
-	urlFiles := Scan(dir, ".url")
-	urlFilesLen := len(urlFiles)
-	if urlFilesLen < 1 {
-		log.Fatal("No .url file found")
-	}
-	fmt.Printf("There are %d url files\n", len(urlFiles))
-
-	file, err := os.Create(fmt.Sprintf("%s.txt", getFolderName(dir)))
-	errExit(err)
-	defer file.Close()
-	w := bufio.NewWriter(file)
-
-	for _, s := range urlFiles {
-		ic, err := inifile.NewIniConfigFromPath(s)
-		errExit(err)
-		url, err := ic.Value("InternetShortcut", "URL")
-		errExit(err)
-		fmt.Println("checking", url, ", in", s, "...")
-		protocol := url[0:strings.Index(url, `://`)]
-		if protocol == `http` || protocol == `https` {
-			title, err := getTitle(url)
-			errExit(err)
-			fmt.Fprintf(w, "- [%s](%s)\n", title, url)
-		} else {
-			fmt.Fprintf(w, "- [%s](%s)\n", url, url)
-		}
-	}
-	errExit(w.Flush())
-
-	// for _, s := range urlFiles {
-	// 	errExit(os.Remove(s))
-	// }
+// Go types that are bound to the UI must be thread-safe, because each binding
+// is executed in its own goroutine. In this simple case we may use atomic
+// operations, but for more complex cases one should use proper synchronization.
+type counter struct {
+	sync.Mutex
+	count int
 }
 
-func errExit(err error) {
+func (c *counter) Add(n int) {
+	c.Lock()
+	defer c.Unlock()
+	c.count = c.count + n
+}
+
+func (c *counter) Value() int {
+	c.Lock()
+	defer c.Unlock()
+	return c.count
+}
+
+func main() {
+	args := []string{}
+	if runtime.GOOS == "linux" {
+		args = append(args, "--class=Lorca")
+	}
+	ui, err := lorca.New("", "", 480, 320, args...)
 	if err != nil {
 		log.Fatal(err)
 	}
-}
+	defer ui.Close()
 
-func Scan(root, ext string) []string {
-	var a []string
-	filepath.WalkDir(root, func(s string, d fs.DirEntry, e error) error {
-		if e != nil {
-			return e
-		}
-		if filepath.Ext(d.Name()) == ext {
-			a = append(a, s)
-		}
-		return nil
-	})
-	return a
-}
-
-func getTitle(urlstr string) (string, error) {
-	ctx, cancel := chromedp.NewContext(context.Background())
-	defer cancel()
-	var title string
-
-	chromedp.ListenTarget(ctx, func(ev interface{}) {
-
-		switch ev := ev.(type) {
-
-		case *network.EventResponseReceived:
-			resp := ev.Response
-			if resp.URL == urlstr {
-				log.Printf("received headers: %s %s", resp.URL, resp.MimeType)
-				if resp.MimeType != "text/html" {
-					chromedp.Cancel(ctx)
-				}
-
-				if strings.Contains(resp.URL, "youtube.com") {
-					log.Printf("YT!!")
-				}
-
-				// may be redirected
-				switch ContentType := resp.Headers["Content-Type"].(type) {
-				case string:
-					// here v has type T
-					if !strings.Contains(ContentType, "text/html") {
-						chromedp.Cancel(ctx)
-					}
-				}
-
-				switch ContentType := resp.Headers["content-type"].(type) {
-				case string:
-					// here v has type T
-					if !strings.Contains(ContentType, "text/html") {
-						chromedp.Cancel(ctx)
-					}
-				}
-			}
-		}
+	// A simple way to know when UI is ready (uses body.onload event in JS)
+	ui.Bind("start", func() {
+		log.Println("UI is ready")
 	})
 
-	req := `
-(async () => new Promise((resolve, reject) => {
-	var handle = NaN;
+	// Create and bind Go object to the UI
+	c := &counter{}
+	ui.Bind("counterAdd", c.Add)
+	ui.Bind("counterValue", c.Value)
 
-	(function animate() {
-		if (!isNaN(handle)) {
-			clearTimeout(handle);
-		}
+	// Load HTML.
+	// You may also use `data:text/html,<base64>` approach to load initial HTML,
+	// e.g: ui.Load("data:text/html," + url.PathEscape(html))
 
-		if (document.title.length > 0 && !document.title.startsWith("http")) {
-			resolve(document.title);
-		} else {
-			handle = setTimeout(animate, 1000);
-		}
-	}());
-}));
-`
-	err := chromedp.Run(ctx,
-		chromedp.Navigate(urlstr),
-		//chromedp.Evaluate(`window.location.href`, &res),
-		chromedp.Evaluate(req, nil, func(p *runtime.EvaluateParams) *runtime.EvaluateParams {
-			return p.WithAwaitPromise(true)
-		}),
-		chromedp.Title(&title),
-	)
-	if err == context.Canceled {
-		// url as title
-		log.Printf("Cancel!!")
-		return urlstr, nil
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer ln.Close()
+	go http.Serve(ln, http.FileServer(http.FS(fs)))
+	ui.Load(fmt.Sprintf("http://%s/www", ln.Addr()))
+
+	// You may use console.log to debug your JS code, it will be printed via
+	// log.Println(). Also exceptions are printed in a similar manner.
+	ui.Eval(`
+		console.log("Hello, world!");
+		console.log('Multiple values:', [1, false, {"x":5}]);
+	`)
+
+	// Wait until the interrupt signal arrives or browser window is closed
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, os.Interrupt)
+	select {
+	case <-sigc:
+	case <-ui.Done():
 	}
 
-	return title, err
-}
-
-// fmt.Println(getFolderName(`P`))           //P
-// fmt.Println(getFolderName(`P:`))          //P
-// fmt.Println(getFolderName(`P:\`))         //P
-// fmt.Println(getFolderName(`P:\testing`))  //testing
-// fmt.Println(getFolderName(`P:\testing\`)) //testing
-func getFolderName(input string) string {
-	var folderName string
-	lastIndex := strings.LastIndex(input, `\`)
-	length := len(input)
-	if lastIndex+1 == length {
-		lastIndex = strings.LastIndex(input[0:length-1], `\`)
-		folderName = input[lastIndex+1 : length-1]
-	} else {
-		folderName = input[lastIndex+1 : length]
-	}
-
-	if folderName[len(folderName)-1:] == ":" {
-		return folderName[0 : len(folderName)-1]
-	} else {
-		return folderName
-	}
+	log.Println("exiting...")
 }
