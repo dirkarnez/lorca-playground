@@ -20,7 +20,7 @@ jobs:
           
       - run: go get .
       
-      - run: go build
+      - run: go build -ldflags "-H windowsgui"
       
       - name: Archive Release
         uses: thedoctor0/zip-release@master
